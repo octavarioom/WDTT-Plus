@@ -31,3 +31,8 @@ require (
 	golang.org/x/sys v0.39.0 // indirect
 	golang.org/x/text v0.36.0 // indirect
 )
+
+// PATCH (WDTT mobile): use our local, patched copy of pion/turn.
+// It re-tries failed TURN channel binds so the VK-relay return path can move
+// onto ChannelData instead of STUN Data indications on restrictive mobile links.
+replace github.com/pion/turn/v5 => ./patched-turn
