@@ -878,41 +878,108 @@ func GetCreds(ctx context.Context, link string, streamID int) (string, string, [
 
 // ─── DNS dialer setup ───
 
+// resolverServers is the ordered list of candidate DNS resolvers. Operator
+// resolvers come first: they stay reachable on mobile "white list" networks and
+// resolve VK correctly, whereas the previously hard-coded Yandex resolver is
+// blocked there. Public resolvers are last for normal networks / Wi-Fi.
+var resolverServers = []string{
+	"95.167.167.95:53", // Rostelecom / Tele2 operator DNS
+	"95.167.167.96:53", // Rostelecom / Tele2 operator DNS
+	"77.88.8.8:53",     // Yandex
+	"77.88.8.1:53",     // Yandex
+	"1.1.1.1:53",       // Cloudflare
+	"8.8.8.8:53",       // Google
+}
+
+var (
+	chosenDNSMu sync.Mutex
+	chosenDNS   string
+)
+
+// setupGlobalResolver installs a global DNS resolver that picks a resolver which
+// actually answers, instead of blindly using Yandex. The original code always
+// "succeeded" dialing an unreachable UDP resolver (a UDP dial never fails), so on
+// white-list networks queries were sent into a black hole and the system fallback
+// never triggered. See pickWorkingDNS.
 func setupGlobalResolver() {
 	dialer := &net.Dialer{
 		Timeout:   3 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
-	yandexDNSServers := []string{"77.88.8.8:53", "77.88.8.1:53"}
-
 	net.DefaultResolver = &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			var lastErr error
-			for _, dns := range yandexDNSServers {
-				conn, err := dialer.DialContext(ctx, "udp", dns)
-				if err == nil {
+			server := pickWorkingDNS()
+			if server != "" {
+				proto := "udp"
+				if network == "tcp" || network == "tcp4" || network == "tcp6" {
+					proto = "tcp"
+				}
+				if conn, err := dialer.DialContext(ctx, proto, server); err == nil {
 					return conn, nil
 				}
-				lastErr = err
-				conn, err = dialer.DialContext(ctx, "tcp", dns)
-				if err == nil {
-					return conn, nil
-				}
-				lastErr = err
 			}
-
+			// Last resort: whatever DNS the system handed us.
 			address = strings.TrimSpace(address)
-			if address != "" && !isYandexDNSAddress(address) {
-				conn, err := dialer.DialContext(ctx, network, address)
-				if err == nil {
-					return conn, nil
-				}
-				lastErr = err
+			if address != "" {
+				return dialer.DialContext(ctx, network, address)
 			}
-			return nil, lastErr
+			return nil, fmt.Errorf("no working DNS resolver found")
 		},
 	}
+}
+
+// pickWorkingDNS returns the first candidate resolver that actually answers a DNS
+// query, caching the choice and re-probing when the cached one stops answering
+// (e.g. after a Wi-Fi <-> mobile switch).
+func pickWorkingDNS() string {
+	chosenDNSMu.Lock()
+	cached := chosenDNS
+	chosenDNSMu.Unlock()
+	if cached != "" && dnsServerResponds(cached) {
+		return cached
+	}
+	for _, s := range resolverServers {
+		if dnsServerResponds(s) {
+			chosenDNSMu.Lock()
+			chosenDNS = s
+			chosenDNSMu.Unlock()
+			log.Printf("[СЕТЬ] Рабочий DNS выбран: %s", s)
+			return s
+		}
+	}
+	chosenDNSMu.Lock()
+	chosenDNS = ""
+	chosenDNSMu.Unlock()
+	return ""
+}
+
+// dnsServerResponds reports whether server answers a minimal A query for vk.com
+// within a short timeout.
+func dnsServerResponds(server string) bool {
+	conn, err := net.DialTimeout("udp", server, 2*time.Second)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Write(buildDNSQueryA("vk.com")); err != nil {
+		return false
+	}
+	buf := make([]byte, 512)
+	n, err := conn.Read(buf)
+	return err == nil && n > 12
+}
+
+// buildDNSQueryA builds a minimal DNS A-record query packet for name.
+func buildDNSQueryA(name string) []byte {
+	b := []byte{0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	for _, label := range strings.Split(name, ".") {
+		b = append(b, byte(len(label)))
+		b = append(b, []byte(label)...)
+	}
+	b = append(b, 0x00, 0x00, 0x01, 0x00, 0x01)
+	return b
 }
 
 func isYandexDNSAddress(address string) bool {
